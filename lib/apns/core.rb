@@ -1,5 +1,5 @@
 # Copyright (c) 2009 James Pozdena, 2010 Justin.tv
-#  
+#
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
 # files (the "Software"), to deal in the Software without
@@ -8,10 +8,10 @@
 # copies of the Software, and to permit persons to whom the
 # Software is furnished to do so, subject to the following
 # conditions:
-#  
+#
 # The above copyright notice and this permission notice shall be
 # included in all copies or substantial portions of the Software.
-#  
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 # EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
 # OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
@@ -20,11 +20,19 @@
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
- 
+
 module APNS
   require 'socket'
   require 'openssl'
   require 'json'
+
+  class Configuration
+    attr_accessor :name, :pem, :pass, :cache
+
+    def initialize
+      @cache = false
+    end
+  end
 
   # Host for push notification service
   # production: gateway.push.apple.com
@@ -39,20 +47,30 @@ module APNS
   @feedback_port = 2196
 
   # openssl pkcs12 -in mycert.p12 -out client-cert.pem -nodes -clcerts
-  @pem = nil # this should be the path of the pem file not the contentes
-  @pass = nil
 
-  @cache_connections = false
+  @configurations = {}
+  @cache_connections = {}
   @connections = {}
 
   class << self
     attr_accessor :host, :port, :feedback_host, :feedback_port, :pem, :pass, :cache_connections
   end
 
-  def self.establish_notification_connection
-    if @cache_connections
+  def self.configure
+    yield self
+  end
+
+  def self.add_connection
+    c =  Configuration.new
+    yield c
+    @configurations[c.name] = [c.pem, c.pass]
+    @cache_connections[c.name] = c.cache
+  end
+
+  def self.establish_notification_connection(connection_name)
+    if @cache_connections[connection_name]
       begin
-        self.get_connection(self.host, self.port)
+        self.get_connection(connection_name, self.host, self.port)
         return true
       rescue
       end
@@ -60,26 +78,26 @@ module APNS
     return false
   end
 
-  def self.has_notification_connection?
-    return self.has_connection?(self.host, self.port)
+  def self.has_notification_connection?(connection_name)
+    return self.has_connection?(connection_name)
   end
 
-  def self.send_notification(device_token, message)
-    self.with_notification_connection do |conn|
+  def self.send_notification(device_token, message, connection_name = nil)
+    self.with_notification_connection(connection_name) do |conn|
       conn.write(self.packaged_notification(device_token, message))
       conn.flush
     end
   end
-  
-  def self.send_notifications(notifications)
-    self.with_notification_connection do |conn|
+
+  def self.send_notifications(notifications, connection_name = nil)
+    self.with_notification_connection(connection_name) do |conn|
       notifications.each do |n|
         conn.write(self.packaged_notification(n[0], n[1]))
       end
       conn.flush
     end
   end
-  
+
   def self.feedback
     apns_feedback = []
     self.with_feedback_connection do |conn|
@@ -89,7 +107,7 @@ module APNS
         apns_feedback << self.parse_feedback_tuple(data)
       end
     end
-    
+
     return apns_feedback
   end
 
@@ -114,11 +132,11 @@ module APNS
     pm = self.packaged_message(message)
     [0, 0, 32, pt, 0, pm.size, pm].pack("ccca*cca*")
   end
-  
+
   def self.packaged_token(device_token)
     [device_token.gsub(/[\s|<|>]/,'')].pack('H*')
   end
-  
+
   def self.packaged_message(message)
     if message.is_a?(Hash)
       message.to_json
@@ -128,9 +146,9 @@ module APNS
       raise "Message needs to be either a hash or string"
     end
   end
-  
-  def self.with_notification_connection(&block)
-    self.with_connection(self.host, self.port, &block)
+
+  def self.with_notification_connection(connection_name, &block)
+    self.with_connection(connection_name, self.host, self.port, &block)
   end
 
   def self.with_feedback_connection(&block)
@@ -143,16 +161,23 @@ module APNS
   ensure
     @cache_connections = cache_temp
   end
- 
+
   private
 
-  def self.open_connection(host, port)
-    raise "The path to your pem file is not set. (APNS.pem = /path/to/cert.pem)" unless self.pem
-    raise "The path to your pem file does not exist!" unless File.exist?(self.pem)
-    
+  def self.open_connection(connection_name, host, port)
+    if connection_name.nil?
+      raise "No connection has been set" if @configurations.empty?
+      pem, pass = @configurations.first
+    else
+      pem, pass = @configurations[connection_name]
+    end
+
+    raise "The path to your pem file is not set. (APNS.pem = /path/to/cert.pem)" unless pem
+    raise "The path to your pem file does not exist!" unless File.exist?(pem)
+
     context      = OpenSSL::SSL::SSLContext.new
-    context.cert = OpenSSL::X509::Certificate.new(File.read(self.pem))
-    context.key  = OpenSSL::PKey::RSA.new(File.read(self.pem), self.pass)
+    context.cert = OpenSSL::X509::Certificate.new(File.read(pem))
+    context.key  = OpenSSL::PKey::RSA.new(File.read(pem), pass)
 
     retries = 0
     begin
@@ -171,64 +196,64 @@ module APNS
     end
   end
 
-  def self.has_connection?(host, port)
-    @connections.has_key?([host,port])
+  def self.has_connection?(connection_name)
+    @connections.has_key?(connection_name)
   end
 
-  def self.create_connection(host, port)
-    @connections[[host, port]] = self.open_connection(host, port)
+  def self.create_connection(connection_name, host, port)
+    @connections[connection_name] = self.open_connection(connection_name, host, port)
   end
 
-  def self.find_connection(host, port)
-    @connections[[host, port]]
+  def self.find_connection(connection_name)
+    @connections[connection_name]
   end
 
-  def self.remove_connection(host, port)
-    if self.has_connection?(host, port)
-      ssl, sock = @connections.delete([host, port])
+  def self.remove_connection(connection_name)
+    if self.has_connection?(connection_name)
+      ssl, sock = @connections.delete(connection_name)
       ssl.close
       sock.close
     end
   end
 
-  def self.reconnect_connection(host, port)
-    self.remove_connection(host, port)
-    self.create_connection(host, port)
+  def self.reconnect_connection(connection_name, host, port)
+    self.remove_connection(connection_name)
+    self.create_connection(connection_name, host, port)
   end
 
-  def self.get_connection(host, port)
-    if @cache_connections
+  def self.get_connection(connection_name, host, port)
+    if @cache_connections[connection_name]
       # Create a new connection if we don't have one
-      unless self.has_connection?(host, port)
-        self.create_connection(host, port)
+      unless self.has_connection?(connection_name)
+        self.create_connection(connection_name, host, port)
       end
 
-      ssl, sock = self.find_connection(host, port)
+      ssl, sock = self.find_connection(connection_name)
       # If we're closed, reconnect
       if ssl.closed?
-        self.reconnect_connection(host, port)
-        self.find_connection(host, port)
+        self.reconnect_connection(connection_name, host, port)
+        self.find_connection(connection_name)
       else
         return [ssl, sock]
       end
     else
-      self.open_connection(host, port)
+      self.open_connection(connection_name, host, port)
     end
   end
 
-  def self.with_connection(host, port, &block)
+  def self.with_connection(connection_name, host, port, &block)
     retries = 0
     begin
-      ssl, sock = self.get_connection(host, port)
+      ssl, sock = self.get_connection(connection_name, host, port)
       yield ssl if block_given?
 
-      unless @cache_connections
+      unless @cache_connections[connection_name]
         ssl.close
         sock.close
       end
     rescue Errno::ECONNABORTED, Errno::EPIPE, Errno::ECONNRESET
       if (retries += 1) < 5
-        self.remove_connection(host, port)
+        self.remove_connection(connection_name)
         retry
       else
         # too-many retries, re-raise
