@@ -98,9 +98,9 @@ module APNS
     end
   end
 
-  def self.feedback
+  def self.feedback(connection_name = nil)
     apns_feedback = []
-    self.with_feedback_connection do |conn|
+    self.with_feedback_connection(connection_name) do |conn|
       # Read buffers data from the OS, so it's probably not
       # too inefficient to do the small reads
       while data = conn.read(38)
@@ -151,15 +151,15 @@ module APNS
     self.with_connection(connection_name, self.host, self.port, &block)
   end
 
-  def self.with_feedback_connection(&block)
+  def self.with_feedback_connection(connection_name, &block)
     # Explicitly disable the connection cache for feedback
-    cache_temp = @cache_connections
-    @cache_connections = false
+    cache_temp = @cache_connections[connection_name]
+    @cache_connections[connection_name] = false
 
-    self.with_connection(self.feedback_host, self.feedback_port, &block)
+    self.with_connection(connection_name, self.feedback_host, self.feedback_port, &block)
 
   ensure
-    @cache_connections = cache_temp
+    @cache_connections[connection_name] = cache_temp
   end
 
   private
